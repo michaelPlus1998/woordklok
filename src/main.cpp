@@ -1159,12 +1159,12 @@ String generateConfigPage() {
     
     html += "<div class='form-group'>";
     html += "<label>NTP Server:</label>";
-    html += "<input type='text' name='ntpserver' value='" + String(config.ntpServer) + "'>";
+    html += "<input type='text' name='ntpserver' value='" + String(config.ntpServer) + "' placeholder='time.google.com'>";
     html += "</div>";
     
     html += "<div class='form-group'>";
     html += "<label>Brightness (10-255):</label>";
-    html += "<input type='number' name='brightness' min='10' max='255' value='" + String(config.brightness) + "'>";
+    html += "<input type='number' name='brightness' min='10' max='255' value='" + String(config.brightness) + "' placeholder='128'>";
     html += "</div>";
     
     html += "<button type='submit'>Save & Restart</button>";
