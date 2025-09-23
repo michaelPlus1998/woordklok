@@ -1054,7 +1054,7 @@ void setupWebServer() {
 
 String generateUpdateSection() {
     String html = "<div style='margin-top:20px;padding:15px;background:#f9f9f9;border-radius:5px;'>";
-    html += "<h3>🔄 Firmware Update</h3>";
+    html += "<h3>Firmware Update</h3>";
     html += "<div class='form-group'>";
     html += "<label>Current Version:</label>";
     html += "<div style='padding:5px;background:white;border:1px solid #ddd;border-radius:3px;'>";
@@ -1068,19 +1068,19 @@ String generateUpdateSection() {
         html += latestVersion;
         html += " (Update Available!)</div></div>";
         
-        html += "<button type='button' onclick='performUpdate()' style='background:#ff9800;color:white;padding:10px 20px;border:none;border-radius:4px;margin:5px;'>📥 Download Update</button>";
+        html += "<button type='button' onclick='performUpdate()' style='background:#ff9800;color:white;padding:10px 20px;border:none;border-radius:4px;margin:5px;'>Download Update</button>";
     } else {
         html += "<div class='form-group' style='color:#666;'>No updates available</div>";
     }
     
     if (LittleFS.exists(UPDATE_FILE_PATH)) {
         html += "<div style='background:#e8f5e8;padding:10px;border-radius:5px;margin:10px 0;'>";
-        html += "<strong>✅ Update Ready!</strong><br>";
+        html += "<strong>Update Ready!</strong><br>";
         html += "<a href='/update-status'>Click here for installation instructions</a>";
         html += "</div>";
     }
     
-    html += "<button type='button' onclick='checkUpdates()' style='background:#2196F3;color:white;padding:10px 20px;border:none;border-radius:4px;'>🔍 Check for Updates</button>";
+    html += "<button type='button' onclick='checkUpdates()' style='background:#2196F3;color:white;padding:10px 20px;border:none;border-radius:4px;'>Check for Updates</button>";
     html += "</div>";
     
     return html;
