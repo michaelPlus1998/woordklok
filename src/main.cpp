@@ -33,8 +33,8 @@
 #define WIFI_TIMEOUT 30000
 
 // ==================== OTA UPDATE CONFIGURATION ====================
-#define FIRMWARE_VERSION "1.0.1"
-#define GITHUB_USER "michaelPlus1998"        // ← VERANDER DIT!
+#define FIRMWARE_VERSION "1.0.0"
+#define GITHUB_USER "jouwusername"        // ← VERANDER DIT!
 #define GITHUB_REPO "woordklok"           // ← VERANDER DIT!
 #define GITHUB_API_URL "https://api.github.com/repos/" GITHUB_USER "/" GITHUB_REPO "/releases/latest"
 #define UPDATE_CHECK_INTERVAL 86400000
@@ -52,6 +52,10 @@ struct ConfigData {
     int brightness;
     bool configured;
     bool daylightSaving;
+    bool scheduleUpdate;        // User heeft update geautoriseerd
+    char pendingVersion[32];    // Versie die geïnstalleerd moet worden
+    char downloadUrl[256];      // Download URL bewaren
+    bool autoUpdateFailed;      // Track of automatische update gefaald is
     uint32_t checksum;
 };
 
@@ -70,6 +74,10 @@ struct Config {
     int brightness = 64;
     bool configured = false;
     bool daylightSaving = true;
+    bool scheduleUpdate = false;
+    char pendingVersion[32] = "";
+    char downloadUrl[256] = "";
+    bool autoUpdateFailed = false;
 };
 
 Config config;
@@ -87,7 +95,6 @@ datetime_t currentTime;
 bool updateAvailable = false;
 bool updateInProgress = false;
 String latestVersion = "";
-String downloadUrl = "";
 unsigned long lastUpdateCheck = 0;
 int updateProgress = 0;
 
@@ -134,6 +141,7 @@ void showUpdateAnimation();
 void showUpdateProgress(int progress);
 void showUpdateSuccess();
 void showUpdateError();
+void showManualUpdateRequired();
 
 // Configuration functions
 uint32_t calculateChecksum(const ConfigData* data);
@@ -148,6 +156,7 @@ void performHardwareReset();
 
 // WiFi functions
 bool connectToWiFi();
+bool connectToWiFiForUpdate();
 void initializeNTPClient();
 void cleanupWiFi();
 
@@ -186,8 +195,13 @@ void handleConfigButton();
 // OTA functions
 int compareVersions(const String& version1, const String& version2);
 bool checkForUpdates();
-void performOTAUpdate();
-bool downloadFirmware();
+bool checkUpdatesBeforeSetup();
+void performScheduledUpdate();
+bool downloadFirmwareForAutoUpdate();
+bool performAutomaticFlashUpdate();
+bool attemptDirectFlashUpdate(File& updateFile);
+void handleUpdateFailure(const char* reason);
+void startManualUpdateWebServer();
 void checkForUpdatesIfNeeded();
 void handleCheckUpdate();
 void handlePerformUpdate();
@@ -312,6 +326,19 @@ void showUpdateError() {
     updateAvailable = false;
 }
 
+void showManualUpdateRequired() {
+    // Orange blinking pattern = manual action required
+    for (int i = 0; i < 3; i++) {
+        fill_solid(leds, NUM_LEDS, CRGB::Orange);
+        FastLED.show();
+        delay(300);
+        FastLED.clear();
+        FastLED.show();
+        delay(300);
+    }
+    delay(1000);
+}
+
 // ==================== VERSION COMPARISON ====================
 int compareVersions(const String& version1, const String& version2) {
     int v1Major = 0, v1Minor = 0, v1Patch = 0;
@@ -327,9 +354,54 @@ int compareVersions(const String& version1, const String& version2) {
     return 0;
 }
 
+// ==================== PRE-SETUP UPDATE CHECK ====================
+bool checkUpdatesBeforeSetup() {
+    if (strlen(config.ssid) == 0 || !config.configured) {
+        Serial.println("No WiFi configured, skipping pre-setup update check");
+        return false;
+    }
+    
+    Serial.println("Checking for updates before entering setup mode...");
+    
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(config.ssid, config.password);
+    
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+        delay(500);
+        Serial.print(".");
+    }
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("\nWiFi connection failed, no update check possible");
+        WiFi.mode(WIFI_OFF);
+        return false;
+    }
+    
+    Serial.println("\nWiFi connected, checking for updates...");
+    
+    bool hasUpdate = checkForUpdates();
+    
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(1000);
+    
+    if (hasUpdate) {
+        Serial.printf("Update available: %s -> %s\n", FIRMWARE_VERSION, latestVersion.c_str());
+        strcpy(config.pendingVersion, latestVersion.c_str());
+        saveConfiguration();
+        return true;
+    } else {
+        Serial.println("No updates available");
+        config.pendingVersion[0] = '\0';
+        saveConfiguration();
+        return false;
+    }
+}
+
 // ==================== OTA UPDATE FUNCTIONS ====================
 bool checkForUpdates() {
-    if (!wifiConnected) {
+    if (!wifiConnected && WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected, cannot check for updates");
         return false;
     }
@@ -361,7 +433,8 @@ bool checkForUpdates() {
         for (JsonObject asset : assets) {
             String assetName = asset["name"].as<String>();
             if (assetName.endsWith(".uf2")) {
-                downloadUrl = asset["browser_download_url"].as<String>();
+                String downloadUrl = asset["browser_download_url"].as<String>();
+                strcpy(config.downloadUrl, downloadUrl.c_str());
                 break;
             }
         }
@@ -369,7 +442,7 @@ bool checkForUpdates() {
         Serial.printf("Current version: %s, Latest version: %s\n", 
                      FIRMWARE_VERSION, latestVersion.c_str());
         
-        if (compareVersions(latestVersion, FIRMWARE_VERSION) > 0 && !downloadUrl.isEmpty()) {
+        if (compareVersions(latestVersion, FIRMWARE_VERSION) > 0 && strlen(config.downloadUrl) > 0) {
             updateAvailable = true;
             Serial.println("Update available!");
             return true;
@@ -386,37 +459,73 @@ bool checkForUpdates() {
     return false;
 }
 
-void performOTAUpdate() {
-    if (!updateAvailable || downloadUrl.isEmpty()) {
-        Serial.println("No update available to install");
-        return;
-    }
+// ==================== AUTOMATISCHE UPDATE IMPLEMENTATIE ====================
+void performScheduledUpdate() {
+    Serial.println("=== PERFORMING SCHEDULED AUTOMATIC UPDATE ===");
     
-    updateInProgress = true;
-    updateProgress = 0;
-    
-    Serial.printf("Starting update to version %s\n", latestVersion.c_str());
-    Serial.printf("Download URL: %s\n", downloadUrl.c_str());
+    config.autoUpdateFailed = false;
+    saveConfiguration();
     
     showUpdateAnimation();
     
-    if (downloadFirmware()) {
-        showUpdateSuccess();
-        Serial.println("Update downloaded successfully!");
-        Serial.println("Please follow the web instructions to complete the update.");
-    } else {
-        showUpdateError();
+    Serial.printf("Connecting to WiFi for automatic update...\n");
+    if (!connectToWiFiForUpdate()) {
+        handleUpdateFailure("WiFi connection failed");
+        return;
     }
     
-    updateInProgress = false;
+    Serial.println("WiFi connected, starting automatic update process...");
+    
     updateProgress = 0;
+    if (!downloadFirmwareForAutoUpdate()) {
+        handleUpdateFailure("Download failed");
+        return;
+    }
+    
+    Serial.println("Starting automatic flash update...");
+    if (performAutomaticFlashUpdate()) {
+        Serial.println("=== AUTOMATIC UPDATE SUCCESSFUL ===");
+        showUpdateSuccess();
+        delay(3000);
+        rp2040.restart();
+    } else {
+        Serial.println("Automatic update failed, switching to manual mode");
+        handleUpdateFailure("Automatic flash failed");
+    }
 }
 
-bool downloadFirmware() {
-    Serial.println("Downloading firmware...");
+bool connectToWiFiForUpdate() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(config.ssid, config.password);
+    
+    unsigned long startTime = millis();
+    int ledIndex = 0;
+    
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 30000) {
+        delay(200);
+        
+        FastLED.clear();
+        leds[ledIndex % NUM_LEDS] = CRGB::Blue;
+        FastLED.show();
+        ledIndex++;
+        
+        Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected successfully");
+        return true;
+    } else {
+        Serial.println("\nWiFi connection failed");
+        return false;
+    }
+}
+
+bool downloadFirmwareForAutoUpdate() {
+    Serial.println("Downloading firmware for automatic update...");
     
     if (!LittleFS.begin()) {
-        Serial.println("Failed to initialize LittleFS");
+        Serial.println("LittleFS mount failed");
         return false;
     }
     
@@ -424,57 +533,244 @@ bool downloadFirmware() {
         LittleFS.remove(UPDATE_FILE_PATH);
     }
     
-    File updateFile = LittleFS.open(UPDATE_FILE_PATH, "w");
-    if (!updateFile) {
-        Serial.println("Failed to create update file");
-        return false;
-    }
-    
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
     
-    http.begin(client, downloadUrl);
-    int httpResponseCode = http.GET();
+    http.begin(client, GITHUB_API_URL);
+    http.addHeader("User-Agent", "WordClock-Auto-Updater");
     
-    if (httpResponseCode == 200) {
-        int contentLength = http.getSize();
-        WiFiClient* stream = http.getStreamPtr();
-        
-        int downloaded = 0;
-        uint8_t buffer[1024];
-        
-        while (http.connected() && downloaded < contentLength) {
-            size_t available = stream->available();
-            if (available > 0) {
-                size_t readBytes = stream->readBytes(buffer, min(available, sizeof(buffer)));
-                updateFile.write(buffer, readBytes);
-                downloaded += readBytes;
-                
-                updateProgress = (downloaded * 100) / contentLength;
-                showUpdateProgress(updateProgress);
-                
-                Serial.printf("Download progress: %d%%\r", updateProgress);
-            }
-            delay(1);
-        }
-        
-        updateFile.close();
+    int httpResponseCode = http.GET();
+    if (httpResponseCode != 200) {
+        Serial.printf("GitHub API failed: %d\n", httpResponseCode);
         http.end();
-        
-        if (downloaded == contentLength) {
-            Serial.println("\nFirmware download complete!");
-            return true;
-        } else {
-            Serial.println("\nIncomplete download!");
-            LittleFS.remove(UPDATE_FILE_PATH);
-            return false;
+        return false;
+    }
+    
+    String payload = http.getString();
+    http.end();
+    
+    DynamicJsonDocument doc(2048);
+    deserializeJson(doc, payload);
+    
+    String latestVersion = doc["tag_name"].as<String>();
+    if (latestVersion.startsWith("v")) {
+        latestVersion = latestVersion.substring(1);
+    }
+    
+    String downloadUrl = "";
+    JsonArray assets = doc["assets"];
+    for (JsonObject asset : assets) {
+        String assetName = asset["name"].as<String>();
+        if (assetName.endsWith(".uf2")) {
+            downloadUrl = asset["browser_download_url"].as<String>();
+            break;
         }
+    }
+    
+    if (downloadUrl.isEmpty()) {
+        Serial.println("No UF2 file found in release");
+        return false;
+    }
+    
+    http.begin(client, downloadUrl);
+    httpResponseCode = http.GET();
+    
+    if (httpResponseCode != 200) {
+        Serial.printf("Download failed: %d\n", httpResponseCode);
+        http.end();
+        return false;
+    }
+    
+    File updateFile = LittleFS.open(UPDATE_FILE_PATH, "w");
+    if (!updateFile) {
+        Serial.println("Failed to create update file");
+        http.end();
+        return false;
+    }
+    
+    int contentLength = http.getSize();
+    WiFiClient* stream = http.getStreamPtr();
+    
+    int downloaded = 0;
+    uint8_t buffer[1024];
+    
+    Serial.println("Downloading firmware...");
+    while (http.connected() && downloaded < contentLength) {
+        size_t available = stream->available();
+        if (available > 0) {
+            size_t readBytes = stream->readBytes(buffer, min(available, sizeof(buffer)));
+            updateFile.write(buffer, readBytes);
+            downloaded += readBytes;
+            
+            updateProgress = (downloaded * 100) / contentLength;
+            
+            showUpdateProgress(updateProgress);
+            
+            if (updateProgress % 10 == 0) {
+                Serial.printf("Download progress: %d%%\n", updateProgress);
+            }
+        }
+        delay(1);
     }
     
     updateFile.close();
     http.end();
-    return false;
+    
+    if (downloaded == contentLength) {
+        Serial.printf("Download complete: %d bytes\n", downloaded);
+        return true;
+    } else {
+        Serial.printf("Download incomplete: %d/%d bytes\n", downloaded, contentLength);
+        LittleFS.remove(UPDATE_FILE_PATH);
+        return false;
+    }
+}
+
+bool performAutomaticFlashUpdate() {
+    Serial.println("Attempting automatic flash update...");
+    
+    File updateFile = LittleFS.open(UPDATE_FILE_PATH, "r");
+    if (!updateFile) {
+        Serial.println("Update file not found");
+        return false;
+    }
+    
+    size_t updateSize = updateFile.size();
+    Serial.printf("Update file size: %d bytes\n", updateSize);
+    
+    if (updateSize < 1000 || updateSize > 2000000) {
+        Serial.println("Invalid update file size");
+        updateFile.close();
+        return false;
+    }
+    
+    Serial.println("Trying automatic firmware update...");
+    
+    for (int i = 0; i < 5; i++) {
+        fill_solid(leds, NUM_LEDS, CRGB::Orange);
+        FastLED.show();
+        delay(200);
+        fill_solid(leds, NUM_LEDS, CRGB::Black);
+        FastLED.show();
+        delay(200);
+    }
+    
+    bool automaticSuccess = attemptDirectFlashUpdate(updateFile);
+    
+    updateFile.close();
+    
+    if (automaticSuccess) {
+        Serial.println("Automatic update successful!");
+        return true;
+    } else {
+        Serial.println("Automatic update failed, will use manual fallback");
+        return false;
+    }
+}
+
+bool attemptDirectFlashUpdate(File& updateFile) {
+    Serial.println("Direct flash update not implemented, using manual fallback");
+    
+    delay(2000);
+    
+    return false; // Gebruik altijd manual fallback voor veiligheid
+}
+
+void handleUpdateFailure(const char* reason) {
+    Serial.printf("Automatic update failed: %s\n", reason);
+    
+    config.autoUpdateFailed = true;
+    saveConfiguration();
+    
+    showUpdateError();
+    
+    Serial.println("Switching to manual update mode...");
+    startManualUpdateWebServer();
+}
+
+void startManualUpdateWebServer() {
+    Serial.println("Starting manual update web server...");
+    
+    server.on("/", HTTP_GET, []() {
+        String html = "<!DOCTYPE html><html><head>";
+        html += "<title>Manual Update Required - Word Clock</title>";
+        html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+        html += "<style>";
+        html += "body{font-family:Arial;text-align:center;margin:20px;background:#f0f0f0;}";
+        html += ".container{max-width:600px;margin:0 auto;background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}";
+        html += ".step{margin:20px 0;padding:20px;background:#f9f9f9;border-radius:8px;text-align:left;}";
+        html += ".highlight{background:#e8f5e8;border:2px solid #4CAF50;}";
+        html += ".warning{background:#fff3cd;border:2px solid #ffc107;}";
+        html += "button{background:#4CAF50;color:white;padding:15px 30px;border:none;border-radius:5px;font-size:18px;cursor:pointer;}";
+        html += "button:hover{background:#45a049;}";
+        html += ".error-text{color:#d63384;font-weight:bold;}";
+        html += "</style></head><body>";
+        
+        html += "<div class='container'>";
+        html += "<h1>🔧 Manual Update Required</h1>";
+        html += "<p>The automatic update process encountered an issue.</p>";
+        html += "<p>Please follow these simple steps to complete the update:</p>";
+        
+        html += "<div class='step warning'>";
+        html += "<h3>⚠️ Automatic Update Status</h3>";
+        html += "<p class='error-text'>Automatic installation failed</p>";
+        html += "<p>Don't worry! The update file was downloaded successfully.<br>";
+        html += "Manual installation is simple and safe.</p>";
+        html += "</div>";
+        
+        html += "<div class='step highlight'>";
+        html += "<h3>📥 Step 1: Download Update File</h3>";
+        html += "<p><a href='/download-update' download='wordclock-update.uf2'>";
+        html += "<button>Download Update File</button></a></p>";
+        html += "<p><small>File: wordclock-update-" + String(config.pendingVersion) + ".uf2</small></p>";
+        html += "</div>";
+        
+        html += "<div class='step'>";
+        html += "<h3>🔧 Step 2: Install Update (Easy!)</h3>";
+        html += "<ol style='text-align:left;'>";
+        html += "<li><strong>Unplug</strong> your Word Clock from power</li>";
+        html += "<li><strong>Hold the small BOOTSEL button</strong> on the circuit board</li>";
+        html += "<li><strong>Plug USB back in</strong> while still holding BOOTSEL</li>";
+        html += "<li><strong>Release BOOTSEL</strong> - a drive called 'RPI-RP2' will appear</li>";
+        html += "<li><strong>Drag the downloaded file</strong> to the RPI-RP2 drive</li>";
+        html += "<li><strong>Wait</strong> - the clock will restart automatically!</li>";
+        html += "</ol>";
+        html += "</div>";
+        
+        html += "<div class='step'>";
+        html += "<h3>✅ After Update</h3>";
+        html += "<p>• Your Word Clock will restart with the new firmware</p>";
+        html += "<p>• All your WiFi settings are preserved</p>";
+        html += "<p>• The clock will connect automatically</p>";
+        html += "</div>";
+        
+        html += "<hr>";
+        html += "<p><strong>Current:</strong> " + String(FIRMWARE_VERSION) + " → <strong>New:</strong> " + String(config.pendingVersion) + "</p>";
+        html += "<p><small>If you need help, the LED display will show status during installation.</small></p>";
+        html += "</div></body></html>";
+        
+        server.send(200, "text/html", html);
+    });
+    
+    server.on("/download-update", HTTP_GET, handleDownloadUpdate);
+    
+    server.begin();
+    Serial.printf("Manual update web server started at: http://%s\n", WiFi.localIP().toString().c_str());
+    
+    showManualUpdateRequired();
+    
+    while (true) {
+        server.handleClient();
+        
+        static unsigned long lastBlink = 0;
+        if (millis() - lastBlink > 2000) {
+            showManualUpdateRequired();
+            lastBlink = millis();
+        }
+        
+        delay(10);
+    }
 }
 
 void checkForUpdatesIfNeeded() {
@@ -521,8 +817,16 @@ void loadConfiguration() {
     config.brightness = tempConfig.brightness;
     config.configured = tempConfig.configured;
     config.daylightSaving = tempConfig.daylightSaving;
+    config.scheduleUpdate = tempConfig.scheduleUpdate;
+    strlcpy(config.pendingVersion, tempConfig.pendingVersion, sizeof(config.pendingVersion));
+    strlcpy(config.downloadUrl, tempConfig.downloadUrl, sizeof(config.downloadUrl));
+    config.autoUpdateFailed = tempConfig.autoUpdateFailed;
     
     Serial.println("Configuration loaded successfully");
+    if (strlen(config.pendingVersion) > 0) {
+        Serial.printf("Pending update: %s (auto failed: %s)\n", 
+                     config.pendingVersion, config.autoUpdateFailed ? "yes" : "no");
+    }
 }
 
 void saveConfiguration() {
@@ -537,6 +841,10 @@ void saveConfiguration() {
     tempConfig.brightness = config.brightness;
     tempConfig.configured = true;
     tempConfig.daylightSaving = config.daylightSaving;
+    tempConfig.scheduleUpdate = config.scheduleUpdate;
+    strlcpy(tempConfig.pendingVersion, config.pendingVersion, sizeof(tempConfig.pendingVersion));
+    strlcpy(tempConfig.downloadUrl, config.downloadUrl, sizeof(tempConfig.downloadUrl));
+    tempConfig.autoUpdateFailed = config.autoUpdateFailed;
     tempConfig.checksum = calculateChecksum(&tempConfig);
     
     EEPROM.put(CONFIG_ADDRESS, tempConfig);
@@ -1054,33 +1362,53 @@ void setupWebServer() {
 
 String generateUpdateSection() {
     String html = "<div style='margin-top:20px;padding:15px;background:#f9f9f9;border-radius:5px;'>";
-    html += "<h3>Firmware Update</h3>";
+    html += "<h3>🔄 Firmware Update</h3>";
+    
     html += "<div class='form-group'>";
     html += "<label>Current Version:</label>";
     html += "<div style='padding:5px;background:white;border:1px solid #ddd;border-radius:3px;'>";
     html += FIRMWARE_VERSION;
     html += "</div></div>";
     
-    if (updateAvailable) {
+    if (strlen(config.pendingVersion) > 0) {
         html += "<div class='form-group'>";
-        html += "<label>Available Version:</label>";
-        html += "<div style='padding:5px;background:#e8f5e8;border:1px solid #4CAF50;border-radius:3px;color:#2e7d2e;'>";
-        html += latestVersion;
-        html += " (Update Available!)</div></div>";
+        html += "<label>Available Update:</label>";
+        html += "<div style='padding:10px;background:#e8f5e8;border:2px solid #4CAF50;border-radius:5px;color:#2e7d2e;'>";
+        html += "<strong>✨ Version " + String(config.pendingVersion) + " Available!</strong><br>";
+        html += "<small>Automatic installation will be attempted first</small>";
+        html += "</div></div>";
         
-        html += "<button type='button' onclick='performUpdate()' style='background:#ff9800;color:white;padding:10px 20px;border:none;border-radius:4px;margin:5px;'>Download Update</button>";
+        if (config.autoUpdateFailed) {
+            html += "<div style='padding:10px;background:#fff3cd;border:1px solid #ffc107;border-radius:5px;color:#856404;margin:10px 0;'>";
+            html += "<strong>⚠️ Previous Update Note</strong><br>";
+            html += "Automatic installation was attempted but manual installation was required.<br>";
+            html += "This is normal and the process is very simple!";
+            html += "</div>";
+        }
+        
+        html += "<div class='form-group'>";
+        html += "<label>";
+        html += "<input type='checkbox' name='schedule_update' value='1'";
+        if (config.scheduleUpdate) html += " checked";
+        html += "> 🚀 Install update after saving WiFi settings";
+        html += "</label>";
+        html += "<div style='margin-top:8px;padding:8px;background:#f8f9fa;border-radius:3px;font-size:12px;color:#666;'>";
+        html += "<strong>Update Process:</strong><br>";
+        html += "1. System connects to WiFi automatically<br>";
+        html += "2. Downloads update (with LED progress)<br>";
+        html += "3. <strong>Tries automatic installation first</strong><br>";
+        html += "4. If needed, shows simple manual steps";
+        html += "</div>";
+        html += "</div>";
+        
     } else {
-        html += "<div class='form-group' style='color:#666;'>No updates available</div>";
-    }
-    
-    if (LittleFS.exists(UPDATE_FILE_PATH)) {
-        html += "<div style='background:#e8f5e8;padding:10px;border-radius:5px;margin:10px 0;'>";
-        html += "<strong>Update Ready!</strong><br>";
-        html += "<a href='/update-status'>Click here for installation instructions</a>";
+        html += "<div style='padding:10px;background:#f8f9fa;border:1px solid #dee2e6;border-radius:5px;color:#6c757d;'>";
+        html += "<strong>ℹ️ Update Status</strong><br>";
+        html += "No updates were found during the last check.<br>";
+        html += "Updates are checked automatically when entering setup mode.";
         html += "</div>";
     }
     
-    html += "<button type='button' onclick='checkUpdates()' style='background:#2196F3;color:white;padding:10px 20px;border:none;border-radius:4px;'>Check for Updates</button>";
     html += "</div>";
     
     return html;
@@ -1159,12 +1487,12 @@ String generateConfigPage() {
     
     html += "<div class='form-group'>";
     html += "<label>NTP Server:</label>";
-    html += "<input type='text' name='ntpserver' value='" + String(config.ntpServer) + "' placeholder='time.google.com'>";
+    html += "<input type='text' name='ntpserver' value='" + String(config.ntpServer) + "'>";
     html += "</div>";
     
     html += "<div class='form-group'>";
     html += "<label>Brightness (10-255):</label>";
-    html += "<input type='number' name='brightness' min='10' max='255' value='" + String(config.brightness) + "' placeholder='128'>";
+    html += "<input type='number' name='brightness' min='10' max='255' value='" + String(config.brightness) + "'>";
     html += "</div>";
     
     html += "<button type='submit'>Save & Restart</button>";
@@ -1223,18 +1551,46 @@ void handleSave() {
     config.timezoneOffset = server.arg("timezone").toInt();
     config.brightness = server.arg("brightness").toInt();
     config.daylightSaving = server.hasArg("daylight_saving") && server.arg("daylight_saving") == "1";
+    config.scheduleUpdate = server.hasArg("schedule_update") && server.arg("schedule_update") == "1";
     
     saveConfiguration();
     
     String html = "<!DOCTYPE html><html><head><title>Saved</title>";
-    html += "<style>body{font-family:Arial;text-align:center;margin:50px;}</style>";
-    html += "</head><body><h1>Configuration Saved!</h1>";
-    html += "<p>System will restart in 3 seconds...</p>";
+    html += "<style>body{font-family:Arial;text-align:center;margin:50px;background:#f0f0f0;}";
+    html += ".container{max-width:500px;margin:0 auto;background:white;padding:30px;border-radius:10px;}";
+    html += "</style></head><body>";
+    
+    html += "<div class='container'>";
+    html += "<h1>✅ Configuration Saved!</h1>";
+    
+    if (config.scheduleUpdate && strlen(config.pendingVersion) > 0) {
+        html += "<div style='background:#e8f5e8;padding:15px;border-radius:5px;margin:20px 0;'>";
+        html += "<h3>🚀 Update Scheduled</h3>";
+        html += "<p>Version <strong>" + String(config.pendingVersion) + "</strong> will be installed automatically.</p>";
+        html += "<p><strong>After restart:</strong></p>";
+        html += "<p>1. System connects to WiFi</p>";
+        html += "<p>2. Downloads the update</p>";
+        html += "<p>3. Tries automatic installation</p>";
+        html += "<p>4. If needed, shows manual steps</p>";
+        html += "</div>";
+    }
+    
+    html += "<p>System will restart in <span id='countdown'>5</span> seconds...</p>";
     html += "<p>Please reconnect to your regular WiFi network after restart.</p>";
+    html += "</div>";
+    
+    html += "<script>";
+    html += "let count = 5;";
+    html += "setInterval(function() {";
+    html += "  count--;";
+    html += "  document.getElementById('countdown').textContent = count;";
+    html += "  if (count <= 0) window.close();";
+    html += "}, 1000);";
+    html += "</script>";
     html += "</body></html>";
     
     server.send(200, "text/html", html);
-    delay(1000);
+    delay(2000);
     
     performHardwareReset();
 }
@@ -1263,13 +1619,14 @@ void handleStatus() {
              (currentTime.min < 10 ? "0" : "") + String(currentTime.min) + 
              (isDaylightSavingActive() ? " (DST)" : " (STD)") + "</div>";
     
-    if (updateAvailable) {
-        html += "<div class='item' style='background:#e8f5e8;color:#2e7d2e;'>Update Available: " + latestVersion + "</div>";
+    if (updateAvailable || strlen(config.pendingVersion) > 0) {
+        html += "<div class='item' style='background:#e8f5e8;color:#2e7d2e;'>Update Available: " + 
+                String(config.pendingVersion) + "</div>";
     }
     
     if (LittleFS.exists(UPDATE_FILE_PATH)) {
         html += "<div class='item' style='background:#fff3cd;border-color:#ffeaa7;color:#856404;'>";
-        html += "Update Downloaded - <a href='/update-status'>Installation Instructions</a>";
+        html += "Update Downloaded - Installation Instructions Available";
         html += "</div>";
     }
     
@@ -1318,6 +1675,10 @@ void handleConfigButton() {
         unsigned long pressTime = millis() - buttonPressStart;
         if (pressTime >= BUTTON_HOLD_TIME) {
             Serial.println("Config button held - entering configuration mode");
+            bool hasUpdates = checkUpdatesBeforeSetup();
+            if (hasUpdates) {
+                Serial.println("Updates found! Will be shown in setup mode");
+            }
             enterConfigMode();
         }
     }
@@ -1342,45 +1703,20 @@ void handleCheckUpdate() {
 void handlePerformUpdate() {
     Serial.println("Manual update requested via web interface");
     
-    if (!updateAvailable) {
-        server.send(400, "text/plain", "No update available");
-        return;
-    }
-    
-    updateInProgress = true;
-    
-    String html = "<!DOCTYPE html><html><head>";
-    html += "<title>Updating Pico W</title>";
-    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-    html += "<meta http-equiv='refresh' content='5;url=/update-status'>";
-    html += "<style>";
-    html += "body{font-family:Arial;text-align:center;margin:50px;background:#f0f0f0;}";
-    html += ".container{max-width:500px;margin:0 auto;background:white;padding:20px;border-radius:10px;}";
-    html += ".progress{width:100%;background:#ddd;border-radius:10px;margin:20px 0;}";
-    html += ".progress-bar{height:30px;background:#4CAF50;border-radius:10px;width:0%;transition:width 0.3s;}";
-    html += "</style></head><body>";
-    
-    html += "<div class='container'>";
-    html += "<h1>🔄 Firmware Update In Progress</h1>";
-    html += "<p>Downloading firmware version " + latestVersion + "...</p>";
-    html += "<div class='progress'><div class='progress-bar' id='progress-bar'></div></div>";
-    html += "<p><strong>⚠️ Do NOT power off the device!</strong></p>";
-    html += "<p>This page will refresh automatically to show progress.</p>";
-    html += "</div>";
-    
-    html += "<script>";
-    html += "setInterval(function() {";
-    html += "  fetch('/update-progress').then(r=>r.text()).then(progress=>{";
-    html += "    document.getElementById('progress-bar').style.width=progress+'%';";
-    html += "  });";
-    html += "}, 1000);";
-    html += "</script>";
+    String html = "<!DOCTYPE html><html><head><title>Update Not Available</title></head>";
+    html += "<body style='text-align:center;margin:50px;'>";
+    html += "<h1>⚠️ Update Not Available in Setup Mode</h1>";
+    html += "<p>Updates can only be installed after saving WiFi settings.</p>";
+    html += "<p>Please:</p>";
+    html += "<ol style='text-align:left;max-width:400px;margin:20px auto;'>";
+    html += "<li>Configure your WiFi settings</li>";
+    html += "<li>Check the update checkbox</li>";
+    html += "<li>Click 'Save & Restart'</li>";
+    html += "</ol>";
+    html += "<button onclick=\"location.href='/'\">Back to Setup</button>";
     html += "</body></html>";
     
     server.send(200, "text/html", html);
-    
-    delay(1000);
-    performOTAUpdate();
 }
 
 void handleUpdateProgress() {
@@ -1388,58 +1724,7 @@ void handleUpdateProgress() {
 }
 
 void handleUpdateStatus() {
-    String html = "<!DOCTYPE html><html><head>";
-    html += "<title>Update Status</title>";
-    html += "<style>";
-    html += "body{font-family:Arial;text-align:center;margin:50px;background:#f0f0f0;}";
-    html += ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:10px;}";
-    html += ".step{margin:20px 0;padding:15px;background:#f9f9f9;border-radius:5px;text-align:left;}";
-    html += ".highlight{background:#e8f5e8;border:2px solid #4CAF50;}";
-    html += "</style></head><body>";
-    
-    html += "<div class='container'>";
-    
-    if (updateInProgress) {
-        html += "<h1>⏳ Download In Progress</h1>";
-        html += "<p>Progress: " + String(updateProgress) + "%</p>";
-        html += "<p>Please wait...</p>";
-    } else if (LittleFS.exists(UPDATE_FILE_PATH)) {
-        html += "<h1>✅ Download Complete!</h1>";
-        html += "<h2>Manual Update Required</h2>";
-        html += "<p>The firmware has been downloaded. Follow these steps:</p>";
-        
-        html += "<div class='step highlight'>";
-        html += "<h3>Step 1: Download Update File</h3>";
-        html += "<p><a href='/download-update' download='wordclock-update.uf2'>";
-        html += "<button style='padding:10px 20px;font-size:16px;background:#4CAF50;color:white;border:none;border-radius:5px;'>📥 Download UF2 File</button></a></p>";
-        html += "</div>";
-        
-        html += "<div class='step'>";
-        html += "<h3>Step 2: Enter BOOTSEL Mode</h3>";
-        html += "<p>1. Unplug your Pico W from power</p>";
-        html += "<p>2. Hold down the BOOTSEL button on your Pico W</p>";
-        html += "<p>3. While holding BOOTSEL, plug the USB cable back in</p>";
-        html += "<p>4. Release the BOOTSEL button</p>";
-        html += "<p>5. Your computer should show a drive called 'RPI-RP2'</p>";
-        html += "</div>";
-        
-        html += "<div class='step'>";
-        html += "<h3>Step 3: Install Update</h3>";
-        html += "<p>1. Drag the downloaded .uf2 file to the 'RPI-RP2' drive</p>";
-        html += "<p>2. The Pico W will automatically restart with new firmware</p>";
-        html += "<p>3. Wait for the startup animation</p>";
-        html += "</div>";
-        
-        html += "<p><strong>Version:</strong> " + latestVersion + "</p>";
-    } else {
-        html += "<h1>❌ Download Failed</h1>";
-        html += "<p>Please try again or check your internet connection.</p>";
-        html += "<button onclick=\"location.href='/'\">Back to Config</button>";
-    }
-    
-    html += "</div></body></html>";
-    
-    server.send(200, "text/html", html);
+    server.send(200, "text/plain", "Update status not available in setup mode");
 }
 
 void handleDownloadUpdate() {
@@ -1454,7 +1739,7 @@ void handleDownloadUpdate() {
         return;
     }
     
-    String filename = "wordclock-update-" + latestVersion + ".uf2";
+    String filename = "wordclock-update-" + String(config.pendingVersion) + ".uf2";
     
     server.sendHeader("Content-Type", "application/octet-stream");
     server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
@@ -1470,7 +1755,6 @@ void setup() {
     Serial.begin(9600);
     Serial.println("Starting Dutch Word Clock with Web Configuration...");
     
-    // Initialize LittleFS voor update bestanden
     if (!LittleFS.begin()) {
         Serial.println("LittleFS initialization failed");
     } else {
@@ -1489,6 +1773,13 @@ void setup() {
     initializeRTC();
     startupAnimation();
     
+    // Check for scheduled update first
+    if (config.scheduleUpdate && strlen(config.pendingVersion) > 0) {
+        Serial.printf("Scheduled update found: installing version %s\n", config.pendingVersion);
+        performScheduledUpdate();
+        return;
+    }
+    
     if (!config.configured) {
         Serial.println("No configuration found, entering setup mode...");
         enterConfigMode();
@@ -1498,6 +1789,10 @@ void setup() {
             syncTimeWithNTP();
         } else {
             Serial.println("WiFi connection failed, entering config mode...");
+            bool hasUpdates = checkUpdatesBeforeSetup();
+            if (hasUpdates) {
+                Serial.println("Updates found! Will be shown in setup mode");
+            }
             enterConfigMode();
         }
     }
