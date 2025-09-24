@@ -33,8 +33,13 @@
 #define WIFI_TIMEOUT 30000
 
 // ==================== OTA UPDATE CONFIGURATION ====================
+<<<<<<< HEAD
 #define FIRMWARE_VERSION "1.0.0"
 #define GITHUB_USER "michaelPlus1998"        // ← VERANDER DIT!
+=======
+#define FIRMWARE_VERSION "1.0.4"
+#define GITHUB_USER "jouwusername"        // ← VERANDER DIT!
+>>>>>>> 16c49f032f349426aa64083a53c23bd25f90104f
 #define GITHUB_REPO "woordklok"           // ← VERANDER DIT!
 #define GITHUB_API_URL "https://api.github.com/repos/" GITHUB_USER "/" GITHUB_REPO "/releases/latest"
 #define UPDATE_CHECK_INTERVAL 86400000
