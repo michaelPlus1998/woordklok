@@ -72,8 +72,8 @@ bool rtcInitialized = false;
 datetime_t currentTime;
 
 // ==================== LED MAPPING FOR DUTCH WORDS ====================
-const int HET_LEDS[] = {2, 3, 4};
-const int IS_LEDS[] = {51, 52, 53, 54, 55};
+const int UUR_LEDS[] = {2, 3, 4};
+const int HET_IS_LEDS[] = {51, 52, 53, 54, 55};
 const int AM_LED = 1;
 const int PM_LED = 0;
 
@@ -421,16 +421,22 @@ void displayTime() {
 }
 
 void displayAlwaysOn() {
-    for (int i = 0; i < 3; i++) {
-        leds[HET_LEDS[i]] = CRGB::Yellow;
-    }
     for (int i = 0; i < 5; i++) {
-        leds[IS_LEDS[i]] = CRGB::Yellow;
+        leds[HET_IS_LEDS[i]] = CRGB::Yellow;
     }
 }
 
 void displayAMPM() {
-    if (currentTime.hour < 12) {
+    int hour = currentHour;
+    
+    // Als minuten > 17, dan tonen we al het volgende uur
+    // dus AM/PM moet ook voor dat uur zijn
+    if (currentMinute > 17) {
+        hour++;
+        if (hour >= 24) hour = 0;
+    }
+    
+    if (hour < 12) {
         leds[AM_LED] = CRGB::White;
     } else {
         leds[PM_LED] = CRGB::White;
@@ -464,10 +470,18 @@ void displayHour_func(int hour) {
     }
 }
 
+void displayUUR() {
+    for (int i = 0; i < 3; i++) {
+        leds[UUR_LEDS[i]] = CRGB::White;
+    }
+}
+
+
 void displayMinutes() {
     int minute = currentTime.min;
     
     if (minute == 0) {
+        displayUUR();
         lightUpWord(PRECIES_LEDS, 7);
     }
     else if (minute >= 1 && minute <= 2) {
@@ -649,6 +663,7 @@ void displayMinutes() {
         lightUpWord(VOOR_LEDS, 4);
     }
     else if (minute >= 58 && minute <= 59) {
+        displayUUR();
         lightUpWord(BIJNA_LEDS, 4);
     }
 }
